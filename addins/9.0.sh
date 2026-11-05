@@ -1,2 +1,2 @@
 #!/bin/bash
-GIT_BRANCH="release/9.0"
+GIT_BRANCH="n9.0.2"
