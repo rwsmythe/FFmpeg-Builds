@@ -1,0 +1,382 @@
+name: Build FFmpeg macOS arm64
+
+# Clearwater WP6.5: one dispatch builds FFmpeg release/9.0 at the Windows pin for
+# macOS arm64 with the vendored Riedl build script (macos/build-script), checks
+# the binaries, and publishes ONE archive as a release of this fork. Every action
+# is pinned to a 40-hex commit; nothing here uses build.yml's floating tags.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  FFMPEG_COMMIT: b204e94e90fca64045e9ca7dd44c65678c7eb29e
+  X264_COMMIT: 0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+  MESON_VERSION: 1.11.2
+  DEPLOYMENT_TARGET: '14.0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ffmpeg (macos-26 arm64, gpl, no zvbi)
+    if: ${{ github.repository == 'rwsmythe/FFmpeg-Builds' }}
+    runs-on: macos-26
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    outputs:
+      asset_name: ${{ steps.package.outputs.asset_name }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Record and check the runner
+        run: |
+          set -euo pipefail
+          sw_vers
+          echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          xcode-select -p
+          xcodebuild -version
+          xcrun --show-sdk-version
+          /usr/bin/clang --version
+          /usr/bin/python3 --version
+          test "$(uname -m)" = arm64
+          # the tools the build uses, from the sanitized PATH only
+          for tool in curl git make clang shasum perl zip tar sed awk sysctl cut python3; do
+            env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/sh -c "command -v $tool" || { echo "::error::$tool not found on the sanitized PATH"; exit 1; }
+          done
+          # zvbi (GPL-2.0-only) cannot be built: its script is not vendored
+          # (checked in the directory that holds the vendored scripts)
+          test -f macos/build-script/script/build-ffmpeg.sh
+          test ! -e macos/build-script/script/build-zvbi.sh
+          # the pin list is not empty and every pinned URL appears once
+          # (an assignment fails the step when awk fails)
+          pinned_urls=$(awk '!/^#/ && NF {print $2}' macos/sha256-pins.txt)
+          test -n "$pinned_urls"
+          duplicate_urls=$(printf '%s\n' "$pinned_urls" | sort | uniq -d)
+          if [ -n "$duplicate_urls" ]; then
+            echo "::error::pinned more than once: $duplicate_urls"
+            exit 1
+          fi
+
+      - name: Install meson (pinned by hash)
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/meson-venv"
+          "$RUNNER_TEMP/meson-venv/bin/python3" -m pip install --disable-pip-version-check --no-deps --require-hashes -r macos/meson-requirements.txt
+          test "$("$RUNNER_TEMP/meson-venv/bin/meson" --version)" = "$MESON_VERSION"
+
+      - name: Move /usr/local/include and /usr/local/lib out of the build's reach
+        # ld64 lists /usr/local/lib among its standard library paths and clang its
+        # <sysroot>/usr/local/include; a host header or static library there would
+        # enter the build unpinned and pass every later check (otool -L sees only
+        # dylibs). Each directory is recorded, moved aside, and asserted gone; a
+        # failed move or assertion fails the job. Placed after every setup step the
+        # build relies on (checkout, the runner checks, the meson install) and before
+        # the first configure; put back after the build step.
+        run: |
+          set -euo pipefail
+          for d in /usr/local/include /usr/local/lib; do
+            record="$RUNNER_TEMP/usr-local-$(basename "$d").txt"
+            if [ -e "$d" ] || [ -L "$d" ]; then
+              test ! -e "$d.clearwater-aside"
+              test ! -L "$d.clearwater-aside"
+              # a record, not a check: a listing error is noted, the move is the boundary
+              { sudo find "$d" -maxdepth 2 -print 2>&1 || echo "(find exited $?)"; } > "$record"
+              sudo mv "$d" "$d.clearwater-aside"
+            else
+              echo "$d was absent before the build" > "$record"
+            fi
+            if [ -e "$d" ] || [ -L "$d" ]; then
+              echo "::error::$d still exists after the move"
+              exit 1
+            fi
+          done
+          # record (not a check): the compiler's and the linker's search paths as
+          # the build step sees them (the same sanitized environment)
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/search-probe.c"
+          {
+            echo "== clang -E -v (include search)"
+            env -i HOME="$HOME" TMPDIR="$RUNNER_TEMP" \
+              PATH="$RUNNER_TEMP/meson-venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+              MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+              /usr/bin/clang -x c -E -v "$RUNNER_TEMP/search-probe.c" -o /dev/null 2>&1
+            echo "== clang -Wl,-v (library and framework search)"
+            env -i HOME="$HOME" TMPDIR="$RUNNER_TEMP" \
+              PATH="$RUNNER_TEMP/meson-venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+              MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+              /usr/bin/clang -Wl,-v "$RUNNER_TEMP/search-probe.c" -o "$RUNNER_TEMP/search-probe" 2>&1
+          } > "$RUNNER_TEMP/toolchain-search.txt"
+          cat "$RUNNER_TEMP/usr-local-include.txt" "$RUNNER_TEMP/usr-local-lib.txt" "$RUNNER_TEMP/toolchain-search.txt"
+          # a check: the tools the build step uses still start with /usr/local gone,
+          # under the build's sanitized environment (fails here, not mid-build)
+          env -i HOME="$HOME" TMPDIR="$RUNNER_TEMP" \
+            PATH="$RUNNER_TEMP/meson-venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            /bin/sh -c 'set -e
+              for tool in curl git make clang perl tar python3 meson; do
+                printf "%s: %s\n" "$tool" "$(command -v "$tool")"
+              done
+              curl --version
+              git --version
+              make --version
+              clang --version
+              perl -v
+              tar --version
+              python3 --version
+              meson --version
+              printf x | shasum -a 256'
+
+      - name: Build (vendored Riedl script, sanitized environment)
+        run: |
+          set -euo pipefail
+          mkdir work
+          cd work
+          # env -i: no Homebrew on PATH (/opt/homebrew, /usr/local), no PKG_CONFIG_*,
+          # CPATH, LIBRARY_PATH, CFLAGS / LDFLAGS or HOMEBREW_* from the runner image;
+          # the script's own pkg-config searches only work/tool/lib/pkgconfig.
+          env -i HOME="$HOME" TMPDIR="$RUNNER_TEMP" \
+            PATH="$RUNNER_TEMP/meson-venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            /bin/sh ../macos/build-script/build.sh \
+              -SKIP_TEST=YES -SKIP_BUNDLE=YES -FFMPEG_SNAPSHOT=NO \
+              -SKIP_ZVBI=YES -SKIP_DECKLINK=YES -SKIP_LIBKLVANC=YES -SKIP_RAV1E=YES \
+              -SKIP_SRT=YES -SKIP_ZIMG=YES -SKIP_LIBBLURAY=YES -SKIP_SNAPPY=YES \
+              -SKIP_LIBVMAF=YES -SKIP_AOM=YES -SKIP_DAV1D=YES -SKIP_OPEN_H264=YES \
+              -SKIP_OPEN_JPEG=YES -SKIP_SVT_AV1=YES -SKIP_LIBTHEORA=YES -SKIP_VPX=YES \
+              -SKIP_VVENC=YES -SKIP_LIBWEBP=YES -SKIP_LAME=YES -SKIP_OPUS=YES \
+              -SKIP_LIBVORBIS=YES -SKIP_X264=NO -SKIP_X265=NO -SKIP_X265_MULTIBIT=NO
+
+      - name: Put /usr/local/include and /usr/local/lib back
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          for d in /usr/local/include /usr/local/lib; do
+            if [ -e "$d.clearwater-aside" ] || [ -L "$d.clearwater-aside" ]; then
+              # nothing may have recreated it during the build (mv would nest into it)
+              test ! -e "$d"
+              test ! -L "$d"
+              sudo mv "$d.clearwater-aside" "$d"
+            fi
+          done
+
+      - name: Print the component logs (on failure)
+        if: ${{ failure() }}
+        run: |
+          for f in work/log/*.log; do
+            echo "===== $f (last 80 lines)"
+            tail -n 80 "$f" || true
+          done
+
+      - name: Upload the component logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-macos-arm64-logs
+          path: work/log/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Check the binaries
+        run: |
+          set -euo pipefail
+          B=work/out/bin
+          # the pinned sources were built
+          test "$(git -C work/source/ffmpeg/ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
+          test "$(git -C work/source/x264/x264-master rev-parse HEAD)" = "$X264_COMMIT"
+          for name in zvbi decklink libklvanc rav1e srt; do
+            test "$(cat "work/log/skip-$name")" = YES
+          done
+          for name in x264 x265 openssl; do
+            test "$(cat "work/log/skip-$name")" = NO
+          done
+          for tool in ffmpeg ffprobe; do
+            test -x "$B/$tool"
+            test "$(lipo -archs "$B/$tool")" = arm64
+            file "$B/$tool" | grep -q 'Mach-O 64-bit executable arm64'
+            # awk reads to the end (no early exit: under pipefail a SIGPIPE in otool would fail the step)
+            minos=$(otool -l "$B/$tool" | awk '/cmd LC_BUILD_VERSION/ {found = 1} found && $1 == "minos" && !done {print $2; done = 1}')
+            if [ "$minos" != "$DEPLOYMENT_TARGET" ]; then
+              echo "::error::$tool minos is '$minos', expected $DEPLOYMENT_TARGET"
+              exit 1
+            fi
+            # the backstop: only macOS system libraries are linked dynamically
+            otool -L "$B/$tool" > "work/$tool-otool.txt"
+            tail -n +2 "work/$tool-otool.txt" | awk '{print $1}' > "work/$tool-dylibs.txt"
+            cat "work/$tool-dylibs.txt"
+            # a real dependency record, never an empty one (every executable links libSystem)
+            if ! grep -q -x -F /usr/lib/libSystem.B.dylib "work/$tool-dylibs.txt"; then
+              echo "::error::$tool: the otool -L record lacks /usr/lib/libSystem.B.dylib"
+              exit 1
+            fi
+            # grep -v: 0 = a line outside the allowlist, 1 = none, anything else = grep failed
+            outside_status=0
+            grep -v -E '^(/usr/lib/|/System/Library/)' "work/$tool-dylibs.txt" > "work/$tool-dylibs-outside.txt" || outside_status=$?
+            if [ "$outside_status" -eq 0 ]; then
+              cat "work/$tool-dylibs-outside.txt"
+              echo "::error::$tool links a library outside /usr/lib and /System/Library"
+              exit 1
+            elif [ "$outside_status" -ne 1 ]; then
+              echo "::error::grep failed ($outside_status) on the $tool dylib list"
+              exit 1
+            fi
+          done
+          "$B/ffmpeg" -hide_banner -version > work/ffmpeg-version.txt
+          "$B/ffprobe" -hide_banner -version > work/ffprobe-version.txt
+          cat work/ffmpeg-version.txt
+          token=$(head -n 1 work/ffmpeg-version.txt | awk '{print $3}')
+          echo "$token" | grep -q -E '^n9\.0\.2-47-gb204e94e[0-9a-f]*-[0-9]{8}$' || { echo "::error::unexpected version token $token"; exit 1; }
+          test "$(head -n 1 work/ffprobe-version.txt | awk '{print $3}')" = "$token"
+          configuration=$(grep '^configuration: ' work/ffmpeg-version.txt)
+          for flag in --enable-gpl --enable-version3 --enable-libx265 --enable-libx264 --enable-openssl "--extra-version=${token##*-}"; do
+            echo " $configuration " | grep -q -- " $flag " || { echo "::error::configure line lacks $flag"; exit 1; }
+          done
+          # grep -q: 0 = carried, 1 = absent, anything else = grep failed
+          for flag in --enable-nonfree libfdk --enable-libzvbi --enable-decklink; do
+            flag_status=0
+            printf '%s\n' "$configuration" | grep -q -F -e "$flag" || flag_status=$?
+            if [ "$flag_status" -eq 0 ]; then
+              echo "::error::configure line carries $flag"
+              exit 1
+            elif [ "$flag_status" -ne 1 ]; then
+              echo "::error::grep failed ($flag_status) looking for $flag"
+              exit 1
+            fi
+          done
+          "$B/ffmpeg" -hide_banner -encoders > work/ffmpeg-encoders.txt
+          "$B/ffmpeg" -hide_banner -decoders > work/ffmpeg-decoders.txt
+          for encoder in libx265 hevc_videotoolbox libx264 aac; do
+            awk -v name="$encoder" '$2 == name {found = 1} END {exit !found}' work/ffmpeg-encoders.txt || { echo "::error::encoder $encoder missing"; exit 1; }
+          done
+          for decoder in hevc h264 aac; do
+            awk -v name="$decoder" '$2 == name {found = 1} END {exit !found}' work/ffmpeg-decoders.txt || { echo "::error::decoder $decoder missing"; exit 1; }
+          done
+          grep -E ' (libx265|hevc_videotoolbox|libx264) ' work/ffmpeg-encoders.txt
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          token=$(head -n 1 work/ffmpeg-version.txt | awk '{print $3}')
+          base=${token%-*}
+          root="ffmpeg-${base}-macos-arm64-gpl-9.0"
+          asset="${root}.zip"
+          mkdir -p "pkg/$root/bin" "pkg/$root/build/logs" dist
+          cp work/out/bin/ffmpeg work/out/bin/ffprobe "pkg/$root/bin/"
+          cp work/source/ffmpeg/ffmpeg/COPYING.GPLv3 "pkg/$root/LICENSE.txt"
+          cp work/source/ffmpeg/ffmpeg/LICENSE.md "pkg/$root/build/FFmpeg-LICENSE.md"
+          cp work/ffmpeg-version.txt work/ffprobe-version.txt work/ffmpeg-encoders.txt work/ffmpeg-decoders.txt \
+            work/ffmpeg-dylibs.txt work/ffprobe-dylibs.txt "pkg/$root/build/"
+          cp macos/sha256-pins.txt macos/meson-requirements.txt "pkg/$root/build/"
+          # the records taken before the build: what /usr/local/{include,lib} held
+          # (moved aside for the build) and the toolchain's search paths
+          cp "$RUNNER_TEMP/usr-local-include.txt" "$RUNNER_TEMP/usr-local-lib.txt" \
+            "$RUNNER_TEMP/toolchain-search.txt" "pkg/$root/build/"
+          cp work/log/*.log "pkg/$root/build/logs/"
+          {
+            echo "ffmpeg $(git -C work/source/ffmpeg/ffmpeg rev-parse HEAD) (release/9.0, git describe $base)"
+            echo "x264 $(git -C work/source/x264/x264-master rev-parse HEAD) (git)"
+            for f in macos/build-script/version/*; do
+              echo "$(basename "$f") $(cat "$f")"
+            done
+            echo "meson $MESON_VERSION (build tool, PyPI wheel by hash)"
+            echo "recipe ${GITHUB_REPOSITORY}@${GITHUB_SHA} (vendored git.martin-riedl.de/ffmpeg/build-script f63b8aab8f5ce1a067da86ba69e34a36a7e217e5)"
+          } > "pkg/$root/build/versions.txt"
+          {
+            sw_vers
+            echo "ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+            xcodebuild -version
+            echo "SDK $(xcrun --show-sdk-version) $(xcrun --show-sdk-path)"
+            /usr/bin/clang --version
+            echo "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET"
+            work/tool/bin/cmake --version | sed -n 1p
+            echo "ninja $(work/tool/bin/ninja --version)"
+            echo "pkg-config $(work/tool/bin/pkg-config --version)"
+            work/tool/bin/nasm -v
+            echo "meson $("$RUNNER_TEMP/meson-venv/bin/meson" --version)"
+            echo "run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "pkg/$root/build/toolchain.txt"
+          (cd pkg && zip -X -r -9 "../dist/$asset" "$root")
+          (cd dist && shasum -a 256 "$asset" > checksums.sha256)
+          sha256=$(cut -d ' ' -f 1 dist/checksums.sha256)
+          {
+            echo "FFmpeg ${base} for macOS arm64 (GPL-3.0-or-later, no zvbi), Clearwater WP6.5."
+            echo
+            echo "Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}."
+            echo
+            echo '```'
+            cat "pkg/$root/build/versions.txt"
+            echo
+            grep '^configuration: ' work/ffmpeg-version.txt
+            echo '```'
+          } > dist/release-notes.md
+          unzip -l "dist/$asset"
+          cat dist/checksums.sha256
+          echo "asset_name=$asset" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "version=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish_release:
+    name: Publish release
+    needs: build
+    if: ${{ github.repository == 'rwsmythe/FFmpeg-Builds' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ffmpeg-macos-arm64
+          path: dist
+
+      - name: Create the release and check it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ needs.build.outputs.asset_name }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cd dist
+          tag="ffmpeg-9.0-gb204e94e-macos-arm64-nozvbi-${GITHUB_SHA:0:7}"
+          echo "$SHA256  $ASSET" | sha256sum -c -
+          sha256sum -c checksums.sha256
+          # the tag must not exist: a 404 is the only accepted answer (any other
+          # failure of the lookup fails the job instead of passing as "absent")
+          if tag_lookup=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1); then
+            echo "::error::tag $tag already exists"
+            exit 1
+          elif ! printf '%s\n' "$tag_lookup" | grep -q -F 'HTTP 404'; then
+            echo "::error::tag lookup failed: $tag_lookup"
+            exit 1
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "FFmpeg macOS arm64 $(date -u +'%Y-%m-%d %H:%M')" --notes-file release-notes.md \
+            --latest=false "$ASSET" checksums.sha256
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$GITHUB_SHA"
+          digest=""
+          for attempt in 1 2 3 4 5 6; do
+            digest=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq ".assets[] | select(.name == \"$ASSET\") | .digest")
+            [ -n "$digest" ] && [ "$digest" != null ] && break
+            sleep 10
+          done
+          echo "asset digest: $digest"
+          test "$digest" = "sha256:$SHA256"
