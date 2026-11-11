@@ -54,6 +54,14 @@ checkStatus $? "change directory failed"
 git checkout --detach "$FFMPEG_COMMIT"
 checkStatus $? "checkout of the pinned ffmpeg commit failed"
 
+FFMPEG_PATCH="$SCRIPT_DIR/../patches/ffmpeg/0001-avcodec-videotoolboxenc-set-packet-duration.patch"
+git apply --check "$FFMPEG_PATCH"
+checkStatus $? "ffmpeg packet duration patch check failed"
+git apply "$FFMPEG_PATCH"
+checkStatus $? "ffmpeg packet duration patch application failed"
+shasum -a 256 "$FFMPEG_PATCH"
+checkStatus $? "ffmpeg packet duration patch checksum failed"
+
 # prepare build (Clearwater WP6.5: the extra version is the UTC build date,
 # the form of the Windows build)
 EXTRA_VERSION="$(date -u +%Y%m%d)"

@@ -276,6 +276,7 @@ jobs:
           cp work/ffmpeg-version.txt work/ffprobe-version.txt work/ffmpeg-encoders.txt work/ffmpeg-decoders.txt \
             work/ffmpeg-dylibs.txt work/ffprobe-dylibs.txt "pkg/$root/build/"
           cp macos/sha256-pins.txt macos/meson-requirements.txt "pkg/$root/build/"
+          cp macos/build-script/patches/ffmpeg/0001-avcodec-videotoolboxenc-set-packet-duration.patch "pkg/$root/build/"
           # the records taken before the build: what /usr/local/{include,lib} held
           # (moved aside for the build) and the toolchain's search paths
           cp "$RUNNER_TEMP/usr-local-include.txt" "$RUNNER_TEMP/usr-local-lib.txt" \
@@ -283,6 +284,7 @@ jobs:
           cp work/log/*.log "pkg/$root/build/logs/"
           {
             echo "ffmpeg $(git -C work/source/ffmpeg/ffmpeg rev-parse HEAD) (release/9.0, git describe $base)"
+            shasum -a 256 macos/build-script/patches/ffmpeg/0001-avcodec-videotoolboxenc-set-packet-duration.patch
             echo "x264 $(git -C work/source/x264/x264-master rev-parse HEAD) (git)"
             for f in macos/build-script/version/*; do
               echo "$(basename "$f") $(cat "$f")"
